@@ -1,7 +1,9 @@
-"""Render every text file in a project directory into one syntax-highlighted PDF.
+"""Render every text file in one or more project directories into one syntax-highlighted PDF.
 
 The document opens with a title page (project name, version, company) and a
-clickable table of contents. Layout of every other page:
+clickable table of contents. With several projects the title page shows the
+document name instead, and each project starts with its own title page (name
+and version). Layout of every other page:
     header  : project name + version (left) | file path relative to project (right)
     ------------------------------------------------------------------
     body    : line-numbered, syntax-colored source
@@ -16,6 +18,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -157,8 +160,16 @@ class FileDoc:
 @dataclass
 class TocRow:
     text: str
-    doc: int | None = None  # index into docs; None for a directory heading
-    indent: bool = False
+    key: str | None = None  # bookmark the row links to; None for directory headings and spacers
+    kind: str = "file"      # "file", "dir", "project" or "space"
+    indent: int = 0
+
+
+@dataclass
+class Section:
+    """One project's worth of files."""
+    info: ProjectInfo
+    docs: list[FileDoc]
 
 
 def get_lexer(path: Path, text: str):
@@ -274,14 +285,22 @@ class Renderer:
     # ---- table of contents ------------------------------------------------ #
 
     @staticmethod
-    def _toc_rows(docs: list[FileDoc]) -> list[TocRow]:
-        rows, cur_dir = [], ""
-        for i, doc in enumerate(docs):
-            parent, _, name = doc.rel_path.rpartition("/")
-            if parent != cur_dir:
-                cur_dir = parent
-                rows.append(TocRow(parent + "/"))
-            rows.append(TocRow(name, i, indent=bool(parent)))
+    def _toc_rows(sections: list[Section], grouped: bool) -> list[TocRow]:
+        """Directory headings and file entries, under a heading per project when grouped."""
+        rows: list[TocRow] = []
+        base = 1 if grouped else 0
+        for s_idx, section in enumerate(sections):
+            if grouped:
+                if rows:
+                    rows.append(TocRow("", kind="space"))
+                rows.append(TocRow(section.info.label, f"project{s_idx}", kind="project"))
+            cur_dir = ""
+            for d_idx, doc in enumerate(section.docs):
+                parent, _, name = doc.rel_path.rpartition("/")
+                if parent != cur_dir:
+                    cur_dir = parent
+                    rows.append(TocRow(parent + "/", kind="dir", indent=base))
+                rows.append(TocRow(name, f"file{s_idx}_{d_idx}", indent=base + bool(parent)))
         return rows
 
     def _paginate_toc(self, rows: list[TocRow]) -> list[list[TocRow]]:
@@ -290,17 +309,20 @@ class Renderer:
         first_page = max(2, int((avail - self.toc_heading_h) / self.toc_leading))
         pages, i = [], 0
         while i < len(rows):
-            n = first_page if not pages else per_page
-            chunk = rows[i:i + n]
-            if len(chunk) > 1 and chunk[-1].doc is None and i + n < len(rows):
-                chunk.pop()  # don't leave a directory heading orphaned at the bottom
+            if pages and rows[i].kind == "space":
+                i += 1  # no blank row at the top of a page
+                continue
+            chunk = rows[i:i + (first_page if not pages else per_page)]
+            # don't leave a heading or blank row orphaned at the bottom
+            while len(chunk) > 1 and chunk[-1].kind != "file" and i + len(chunk) < len(rows):
+                chunk.pop()
             pages.append(chunk)
             i += len(chunk)
         return pages or [[]]
 
     toc_heading_h = 44
 
-    def _draw_toc(self, c, rows: list[TocRow], starts: list[int], first: bool):
+    def _draw_toc(self, c, rows: list[TocRow], starts: dict[str, int], first: bool):
         left, right = self.margin, self.page_w - self.margin
         y = self.header_rule_y - 14 - self.toc_size
         if first:
@@ -309,82 +331,104 @@ class Renderer:
             c.drawString(left, y - 8, "Contents")
             y -= self.toc_heading_h
         for row in rows:
-            x = left + (14 if row.indent else 0)
-            font = self.sans if row.doc is not None else self.sans_bold
-            num = str(starts[row.doc]) if row.doc is not None else ""
-            num_w = pdfmetrics.stringWidth(num, self.sans, self.toc_size)
-            text = self._fit(row.text, font, self.toc_size, right - x - num_w - 30)
-            text_w = pdfmetrics.stringWidth(text, font, self.toc_size)
+            if row.kind == "space":
+                y -= self.toc_leading
+                continue
+            x = left + 14 * row.indent
+            font = self.sans if row.kind == "file" else self.sans_bold
+            size = self.toc_size + (1 if row.kind == "project" else 0)
+            num = str(starts[row.key]) if row.key else ""
+            num_w = pdfmetrics.stringWidth(num, font, size)
+            text = self._fit(row.text, font, size, right - x - num_w - 30)
+            text_w = pdfmetrics.stringWidth(text, font, size)
 
             c.setFillColor(TITLE_COLOR)
-            c.setFont(font, self.toc_size)
+            c.setFont(font, size)
             c.drawString(x, y, text)
-            if row.doc is not None:
+            if row.key:
                 c.drawRightString(right, y, num)
                 dot_w = pdfmetrics.stringWidth(" .", self.sans, self.toc_size)
                 n_dots = int((right - num_w - 6 - (x + text_w + 6)) / dot_w)
                 c.setFillColor(LEADER_COLOR)
+                c.setFont(self.sans, self.toc_size)
                 c.drawRightString(right - num_w - 6, y, " ." * max(n_dots, 0))
-                c.linkAbsolute("", f"file{row.doc}",
-                               Rect=(x, y - 4, right, y + self.toc_size), thickness=0)
+                c.linkAbsolute("", row.key, Rect=(x, y - 4, right, y + size), thickness=0)
             y -= self.toc_leading
 
     # ---- title page ---------------------------------------------------- #
 
-    def _draw_title_page(self, c, info: ProjectInfo):
+    def _draw_title_page(self, c, name: str | None, version: str | None, company: str | None):
         cx = self.page_w / 2
         max_w = self.page_w - 2 * self.margin - 20 * mm
-        size = 36
-        while True:
-            lines = simpleSplit(info.name, self.sans_bold, size, max_w)
-            if len(lines) <= 3 or size <= 20:
-                break
-            size -= 2
-        leading = size * 1.2
+        if name:
+            size = 36
+            while True:
+                lines = simpleSplit(name, self.sans_bold, size, max_w)
+                if len(lines) <= 3 or size <= 20:
+                    break
+                size -= 2
+            leading = size * 1.2
 
-        y = self.page_h * 0.6 + (len(lines) - 1) * leading / 2
-        c.setFillColor(TITLE_COLOR)
-        c.setFont(self.sans_bold, size)
-        for line in lines:
-            c.drawCentredString(cx, y, line)
-            y -= leading
-        y += leading  # baseline of the last line
+            y = self.page_h * 0.6 + (len(lines) - 1) * leading / 2
+            c.setFillColor(TITLE_COLOR)
+            c.setFont(self.sans_bold, size)
+            for line in lines:
+                c.drawCentredString(cx, y, line)
+                y -= leading
+            y += leading  # baseline of the last line
 
-        c.setStrokeColor(ACCENT_COLOR)
-        c.setLineWidth(2)
-        c.line(cx - 30, y - 22, cx + 30, y - 22)
+            c.setStrokeColor(ACCENT_COLOR)
+            c.setLineWidth(2)
+            c.line(cx - 30, y - 22, cx + 30, y - 22)
 
-        if info.version:
-            c.setFillColor(SUBTITLE_COLOR)
-            c.setFont(self.sans, 16)
-            c.drawCentredString(cx, y - 52, f"Version {info.version.lstrip('vV')}")
+            if version:
+                c.setFillColor(SUBTITLE_COLOR)
+                c.setFont(self.sans, 16)
+                c.drawCentredString(cx, y - 52, f"Version {version.lstrip('vV')}")
 
-        if info.company:
+        if company:
             c.setFillColor(HEADER_FOOTER_COLOR)
             c.setFont(self.sans_bold, 13)
-            company = simpleSplit(info.company, self.sans_bold, 13, max_w)[0]
+            company = simpleSplit(company, self.sans_bold, 13, max_w)[0]
             c.drawCentredString(cx, self.margin + 25 * mm, company)
 
     # ---- document ------------------------------------------------------ #
 
-    def render(self, out_path: Path, info: ProjectInfo, docs: list[FileDoc],
-               background: str | None, show_line_numbers: bool) -> int:
-        toc_pages = self._paginate_toc(self._toc_rows(docs))
-        starts, page = [], 2 + len(toc_pages)  # title page + contents come first
-        for doc in docs:
-            starts.append(page)
-            page += len(doc.pages)
+    def render(self, out_path: Path, sections: list[Section], background: str | None,
+               show_line_numbers: bool, document_name: str | None = None,
+               company: str | None = None) -> int:
+        """One section renders as a single-project document; several get a document
+        title page plus a title page per project."""
+        grouped = len(sections) > 1
+        if grouped:
+            cover = (document_name, None, company)
+            doc_label = document_name or ""
+        else:
+            info = sections[0].info
+            cover = (info.name, info.version, info.company)
+            doc_label = info.label
+
+        toc_pages = self._paginate_toc(self._toc_rows(sections, grouped))
+        starts: dict[str, int] = {}
+        page = 2 + len(toc_pages)  # title page + contents come first
+        for s_idx, section in enumerate(sections):
+            if grouped:
+                starts[f"project{s_idx}"] = page
+                page += 1
+            for d_idx, doc in enumerate(section.docs):
+                starts[f"file{s_idx}_{d_idx}"] = page
+                page += len(doc.pages)
         total = page - 1
 
         c = canvas.Canvas(str(out_path), pagesize=(self.page_w, self.page_h))
-        c.setTitle(info.label)
+        c.setTitle(doc_label or ", ".join(s.info.label for s in sections))
         c.setSubject("Source code listing")
-        if info.company:
-            c.setAuthor(info.company)
+        if cover[2]:
+            c.setAuthor(cover[2])
 
         c.bookmarkPage("title")
-        c.addOutlineEntry(info.label, "title", level=0)
-        self._draw_title_page(c, info)
+        c.addOutlineEntry(doc_label or "Title", "title", level=0)
+        self._draw_title_page(c, *cover)
         c.showPage()
         page_no = 1
 
@@ -393,22 +437,32 @@ class Renderer:
             if i == 0:
                 c.bookmarkPage("contents")
                 c.addOutlineEntry("Contents", "contents", level=0)
-            self._draw_chrome(c, info.label, "Contents", page_no, total)
+            self._draw_chrome(c, doc_label, "Contents", page_no, total)
             self._draw_toc(c, rows, starts, first=i == 0)
             c.showPage()
 
-        for doc_idx, doc in enumerate(docs):
-            gutter = len(str(max((l.number or 0 for p in doc.pages for l in p), default=1))) + 1
-            for p_idx, page in enumerate(doc.pages):
+        for s_idx, section in enumerate(sections):
+            label, level = section.info.label, 0
+            if grouped:
                 page_no += 1
-                if p_idx == 0:
-                    key = f"file{doc_idx}"
-                    c.bookmarkPage(key)
-                    c.addOutlineEntry(doc.rel_path, key, level=0)
-                self._fill_background(c, background)
-                self._draw_chrome(c, info.label, doc.rel_path, page_no, total)
-                self._draw_body(c, page, gutter if show_line_numbers else 0)
+                key = f"project{s_idx}"
+                c.bookmarkPage(key)
+                c.addOutlineEntry(label, key, level=0, closed=True)
+                self._draw_title_page(c, section.info.name, section.info.version, None)
                 c.showPage()
+                level = 1
+            for d_idx, doc in enumerate(section.docs):
+                gutter = len(str(max((l.number or 0 for p in doc.pages for l in p), default=1))) + 1
+                for p_idx, page in enumerate(doc.pages):
+                    page_no += 1
+                    if p_idx == 0:
+                        key = f"file{s_idx}_{d_idx}"
+                        c.bookmarkPage(key)
+                        c.addOutlineEntry(doc.rel_path, key, level=level)
+                    self._fill_background(c, background)
+                    self._draw_chrome(c, label, doc.rel_path, page_no, total)
+                    self._draw_body(c, page, gutter if show_line_numbers else 0)
+                    c.showPage()
         c.save()
         return total
 
@@ -470,14 +524,18 @@ class Renderer:
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
-        description="Render all files of a project directory into one syntax-highlighted PDF.")
-    p.add_argument("project", type=Path, help="project directory")
+        description="Render all files of one or more project directories into one syntax-highlighted PDF.")
+    p.add_argument("projects", type=Path, nargs="+", metavar="project",
+                   help="project directory; give several to combine them into one PDF")
     p.add_argument("-o", "--output", type=Path,
-                   help="output PDF path (default: <project-name>.pdf in the current directory)")
+                   help="output PDF path (default: <project-name>.pdf, or <document-name>.pdf "
+                        "with several projects, in the current directory)")
+    p.add_argument("--document-name",
+                   help="title for the document title page when combining several projects")
     p.add_argument("--company", help="company name for the title page (overrides the detected one)")
-    p.add_argument("--title", help="project name for the title page and headers (overrides the detected one)")
+    p.add_argument("--title", help="project name for the title page and headers (single project only)")
     p.add_argument("--project-version", metavar="VERSION",
-                   help="project version (overrides the detected one)")
+                   help="project version (single project only)")
     p.add_argument("--style", default="default",
                    help="Pygments color style, e.g. default, friendly, monokai, github-dark (default: default)")
     p.add_argument("--font-size", type=float, default=8.0, help="code font size in points (default: 8)")
@@ -501,11 +559,20 @@ def parse_args(argv=None):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    root = args.project.resolve()
-    if not root.is_dir():
-        print(f"error: {root} is not a directory", file=sys.stderr)
+    roots = [p.resolve() for p in args.projects]
+    for root in roots:
+        if not root.is_dir():
+            print(f"error: {root} is not a directory", file=sys.stderr)
+            return 1
+    multi = len(roots) > 1
+    if multi and (args.title or args.project_version):
+        print("error: --title and --project-version apply to a single project", file=sys.stderr)
         return 1
-    out = (args.output or Path(f"{root.name}.pdf")).resolve()
+    if multi:
+        default_name = re.sub(r"[^\w.-]+", "_", args.document_name or "").strip("_") or "projects"
+    else:
+        default_name = roots[0].name
+    out = (args.output or Path(f"{default_name}.pdf")).resolve()
     try:
         style = get_style_by_name(args.style)
     except ClassNotFound:
@@ -513,33 +580,49 @@ def main(argv=None) -> int:
         return 1
 
     excludes = ([] if args.no_default_excludes else DEFAULT_EXCLUDES) + args.exclude
-    files = collect_files(root, excludes, not args.no_gitignore, skip={out})
-
     renderer = Renderer(args)
-    docs, skipped = [], []
-    for path in files:
-        rel = path.relative_to(root).as_posix()
-        text = read_text(path, args.max_size * 1024)
-        if text is None:
-            skipped.append(rel)
+    sections, skipped = [], []
+    for root in roots:
+        docs = []
+        for path in collect_files(root, excludes, not args.no_gitignore, skip={out}):
+            rel = path.relative_to(root).as_posix()
+            text = read_text(path, args.max_size * 1024)
+            if text is None:
+                skipped.append(f"{root.name}/{rel}" if multi else rel)
+                continue
+            lines = highlight_lines(path, text, style, args.tab_size)
+            docs.append(renderer.layout(rel, lines, not args.no_line_numbers))
+        if not docs:
+            print(f"warning: no text files found in {root}, leaving it out", file=sys.stderr)
             continue
-        lines = highlight_lines(path, text, style, args.tab_size)
-        docs.append(renderer.layout(rel, lines, not args.no_line_numbers))
 
-    if not docs:
+        info = detect(root)
+        if not multi:
+            info.name = args.title or info.name
+            info.version = args.project_version or info.version
+            info.company = args.company or info.company
+        print(f"Project: {info.label}" + (f" — {info.company}" if info.company and not multi else "")
+              + (f"  (from {info.source})" if info.source else ""))
+        sections.append(Section(info, docs))
+
+    if not sections:
         print("error: no text files found", file=sys.stderr)
         return 1
 
-    info = detect(root)
-    info.name = args.title or info.name
-    info.version = args.project_version or info.version
-    info.company = args.company or info.company
-    print(f"Project: {info.label}" + (f" — {info.company}" if info.company else "")
-          + (f"  (from {info.source})" if info.source else ""))
+    company = args.company
+    if multi and not company:
+        # a company detected in every project, and the same one, is the document's company
+        found = {s.info.company for s in sections}
+        company = found.pop() if len(found) == 1 else None
+    if multi and not args.document_name:
+        print("warning: no document name set, so the document title page has no title; "
+              "use --document-name to set one", file=sys.stderr)
 
     out.parent.mkdir(parents=True, exist_ok=True)
-    total = renderer.render(out, info, docs, style.background_color, not args.no_line_numbers)
-    print(f"Wrote {out} — {len(docs)} files, {total} pages")
+    total = renderer.render(out, sections, style.background_color, not args.no_line_numbers,
+                            document_name=args.document_name, company=company)
+    n_files = sum(len(s.docs) for s in sections)
+    print(f"Wrote {out} — {len(sections)} project(s), {n_files} files, {total} pages")
     if skipped:
         print(f"Skipped {len(skipped)} binary/oversized file(s):")
         for rel in skipped:
