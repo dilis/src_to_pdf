@@ -1,7 +1,8 @@
 """Render every text file in a project directory into one syntax-highlighted PDF.
 
-Layout per page:
-    header  : project name (left) | file path relative to project (right)
+The document opens with a title page (project name, version, company) and a
+clickable table of contents. Layout of every other page:
+    header  : project name + version (left) | file path relative to project (right)
     ------------------------------------------------------------------
     body    : line-numbered, syntax-colored source
     ------------------------------------------------------------------
@@ -29,7 +30,10 @@ from reportlab.lib.pagesizes import A4, LETTER, landscape
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.lib.utils import simpleSplit
 from reportlab.pdfgen import canvas
+
+from project_meta import ProjectInfo, detect
 
 DEFAULT_EXCLUDES = [
     ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
@@ -47,9 +51,23 @@ FONT_CANDIDATES = [
 ]
 BUILTIN_FONTS = ("Courier", "Courier-Bold", "Courier-Oblique", "Courier-BoldOblique")
 
+# (regular, bold) sans-serif for the title page, contents and headers
+UI_FONT_CANDIDATES = [
+    [("/System/Library/Fonts/Helvetica.ttc", 0), ("/System/Library/Fonts/Helvetica.ttc", 1)],
+    [("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 0),
+     ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 0)],
+    [("/System/Library/Fonts/Supplemental/Arial.ttf", 0),
+     ("/System/Library/Fonts/Supplemental/Arial Bold.ttf", 0)],
+]
+BUILTIN_UI_FONTS = ("Helvetica", "Helvetica-Bold")
+
 HEADER_FOOTER_COLOR = HexColor("#444444")
 RULE_COLOR = HexColor("#999999")
 LINE_NO_COLOR = HexColor("#aaaaaa")
+TITLE_COLOR = HexColor("#1a1a1a")
+SUBTITLE_COLOR = HexColor("#555555")
+ACCENT_COLOR = HexColor("#2b6cb0")
+LEADER_COLOR = HexColor("#bbbbbb")
 
 
 # --------------------------------------------------------------------------- #
@@ -58,27 +76,31 @@ LINE_NO_COLOR = HexColor("#aaaaaa")
 
 def collect_files(root: Path, excludes: list[str], use_gitignore: bool,
                   skip: set[Path]) -> list[Path]:
-    spec = None
-    gitignore = root / ".gitignore"
-    if use_gitignore and gitignore.is_file():
-        spec = pathspec.GitIgnoreSpec.from_lines(gitignore.read_text(errors="ignore").splitlines())
+    # .gitignore specs by the directory that holds them (nested ones apply to their subtree)
+    specs: dict[Path, pathspec.GitIgnoreSpec] = {}
 
-    def excluded(rel: str, name: str, is_dir: bool) -> bool:
-        if any(fnmatch.fnmatch(name, p) or fnmatch.fnmatch(rel, p) for p in excludes):
+    def excluded(path: Path, is_dir: bool) -> bool:
+        rel = path.relative_to(root).as_posix()
+        if any(fnmatch.fnmatch(path.name, p) or fnmatch.fnmatch(rel, p) for p in excludes):
             return True
-        return bool(spec and spec.match_file(rel + "/" if is_dir else rel))
+        for base, spec in specs.items():
+            if base in path.parents:
+                sub = path.relative_to(base).as_posix()
+                if spec.match_file(sub + "/" if is_dir else sub):
+                    return True
+        return False
 
     found: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
         cur = Path(dirpath)
-        dirnames[:] = sorted(
-            d for d in dirnames
-            if not excluded((cur / d).relative_to(root).as_posix(), d, True)
-        )
+        gitignore = cur / ".gitignore"
+        if use_gitignore and gitignore.is_file():
+            specs[cur] = pathspec.GitIgnoreSpec.from_lines(
+                gitignore.read_text(errors="ignore").splitlines())
+        dirnames[:] = sorted(d for d in dirnames if not excluded(cur / d, True))
         for name in sorted(filenames):
             path = cur / name
-            rel = path.relative_to(root).as_posix()
-            if path.resolve() in skip or excluded(rel, name, False) or not path.is_file():
+            if path.resolve() in skip or excluded(path, False) or not path.is_file():
                 continue
             found.append(path)
     # files in a directory come before its subdirectories
@@ -132,6 +154,13 @@ class FileDoc:
     pages: list[list[VisualLine]] = field(default_factory=list)
 
 
+@dataclass
+class TocRow:
+    text: str
+    doc: int | None = None  # index into docs; None for a directory heading
+    indent: bool = False
+
+
 def get_lexer(path: Path, text: str):
     for fn in (get_lexer_for_filename, guess_lexer_for_filename):
         try:
@@ -149,7 +178,11 @@ def highlight_lines(path: Path, text: str, style, tab_size: int) -> list[list[tu
     lines: list[list[tuple[str, TokenStyle]]] = [[]]
     for ttype, value in get_lexer(path, text).get_tokens(text):
         if ttype not in cache:
-            s = style.style_for_token(ttype)
+            # some lexers emit token types the style doesn't know; use the nearest known parent
+            known = ttype
+            while not style.styles_token(known) and known.parent is not None:
+                known = known.parent
+            s = style.style_for_token(known)
             cache[ttype] = TokenStyle("#" + s["color"] if s["color"] else default_color,
                                       s["bold"], s["italic"])
         tstyle = cache[ttype]
@@ -190,7 +223,13 @@ class Renderer:
         self.font_size = args.font_size
         self.leading = self.font_size * 1.25
         self.header_size = 9
-        self.fonts = self._register_fonts(args.font)
+        self.toc_size = 10
+        self.toc_leading = 16
+        code_fonts = list(FONT_CANDIDATES)
+        if args.font:
+            code_fonts.insert(0, [(args.font, 0)] * 4)
+        self.fonts = self._register_fonts("Code", code_fonts, BUILTIN_FONTS)
+        self.sans, self.sans_bold = self._register_fonts("UI", UI_FONT_CANDIDATES, BUILTIN_UI_FONTS)
         self.char_w = pdfmetrics.stringWidth("M", self.fonts[0], self.font_size)
 
         self.header_y = self.page_h - self.margin
@@ -202,25 +241,21 @@ class Renderer:
         self.lines_per_page = max(1, int((self.body_top - self.body_bottom) / self.leading) + 1)
 
     @staticmethod
-    def _register_fonts(font_dir: str | None) -> tuple[str, str, str, str]:
-        candidates = list(FONT_CANDIDATES)
-        if font_dir:
-            d = Path(font_dir)
-            ttfs = sorted(d.glob("*.ttf")) if d.is_dir() else [d]
-            candidates.insert(0, [(str(ttfs[0]), 0)] * 4 if ttfs else [])
+    def _register_fonts(prefix: str, candidates, builtin: tuple[str, ...]) -> tuple[str, ...]:
+        """Register the first family whose files all exist; fall back to builtin PDF fonts."""
         for family in candidates:
-            if not family or not all(Path(p).is_file() for p, _ in family):
+            if not all(Path(p).is_file() for p, _ in family):
                 continue
             names = []
             try:
                 for idx, (p, sub) in enumerate(family):
-                    name = f"Code-{Path(p).stem}-{sub}-{idx}"
+                    name = f"{prefix}-{Path(p).stem}-{sub}-{idx}"
                     pdfmetrics.registerFont(TTFont(name, p, subfontIndex=sub))
                     names.append(name)
-                return tuple(names)  # type: ignore[return-value]
+                return tuple(names)
             except Exception:
                 continue
-        return BUILTIN_FONTS
+        return builtin
 
     def font_for(self, ts: TokenStyle) -> str:
         return self.fonts[(1 if ts.bold else 0) + (2 if ts.italic else 0)]
@@ -236,12 +271,132 @@ class Renderer:
             doc.pages.append(visual[i:i + self.lines_per_page])
         return doc
 
-    def render(self, out_path: Path, project_name: str, docs: list[FileDoc],
+    # ---- table of contents ------------------------------------------------ #
+
+    @staticmethod
+    def _toc_rows(docs: list[FileDoc]) -> list[TocRow]:
+        rows, cur_dir = [], ""
+        for i, doc in enumerate(docs):
+            parent, _, name = doc.rel_path.rpartition("/")
+            if parent != cur_dir:
+                cur_dir = parent
+                rows.append(TocRow(parent + "/"))
+            rows.append(TocRow(name, i, indent=bool(parent)))
+        return rows
+
+    def _paginate_toc(self, rows: list[TocRow]) -> list[list[TocRow]]:
+        avail = self.header_rule_y - 14 - self.body_bottom
+        per_page = max(2, int(avail / self.toc_leading))
+        first_page = max(2, int((avail - self.toc_heading_h) / self.toc_leading))
+        pages, i = [], 0
+        while i < len(rows):
+            n = first_page if not pages else per_page
+            chunk = rows[i:i + n]
+            if len(chunk) > 1 and chunk[-1].doc is None and i + n < len(rows):
+                chunk.pop()  # don't leave a directory heading orphaned at the bottom
+            pages.append(chunk)
+            i += len(chunk)
+        return pages or [[]]
+
+    toc_heading_h = 44
+
+    def _draw_toc(self, c, rows: list[TocRow], starts: list[int], first: bool):
+        left, right = self.margin, self.page_w - self.margin
+        y = self.header_rule_y - 14 - self.toc_size
+        if first:
+            c.setFillColor(TITLE_COLOR)
+            c.setFont(self.sans_bold, 18)
+            c.drawString(left, y - 8, "Contents")
+            y -= self.toc_heading_h
+        for row in rows:
+            x = left + (14 if row.indent else 0)
+            font = self.sans if row.doc is not None else self.sans_bold
+            num = str(starts[row.doc]) if row.doc is not None else ""
+            num_w = pdfmetrics.stringWidth(num, self.sans, self.toc_size)
+            text = self._fit(row.text, font, self.toc_size, right - x - num_w - 30)
+            text_w = pdfmetrics.stringWidth(text, font, self.toc_size)
+
+            c.setFillColor(TITLE_COLOR)
+            c.setFont(font, self.toc_size)
+            c.drawString(x, y, text)
+            if row.doc is not None:
+                c.drawRightString(right, y, num)
+                dot_w = pdfmetrics.stringWidth(" .", self.sans, self.toc_size)
+                n_dots = int((right - num_w - 6 - (x + text_w + 6)) / dot_w)
+                c.setFillColor(LEADER_COLOR)
+                c.drawRightString(right - num_w - 6, y, " ." * max(n_dots, 0))
+                c.linkAbsolute("", f"file{row.doc}",
+                               Rect=(x, y - 4, right, y + self.toc_size), thickness=0)
+            y -= self.toc_leading
+
+    # ---- title page ---------------------------------------------------- #
+
+    def _draw_title_page(self, c, info: ProjectInfo):
+        cx = self.page_w / 2
+        max_w = self.page_w - 2 * self.margin - 20 * mm
+        size = 36
+        while True:
+            lines = simpleSplit(info.name, self.sans_bold, size, max_w)
+            if len(lines) <= 3 or size <= 20:
+                break
+            size -= 2
+        leading = size * 1.2
+
+        y = self.page_h * 0.6 + (len(lines) - 1) * leading / 2
+        c.setFillColor(TITLE_COLOR)
+        c.setFont(self.sans_bold, size)
+        for line in lines:
+            c.drawCentredString(cx, y, line)
+            y -= leading
+        y += leading  # baseline of the last line
+
+        c.setStrokeColor(ACCENT_COLOR)
+        c.setLineWidth(2)
+        c.line(cx - 30, y - 22, cx + 30, y - 22)
+
+        if info.version:
+            c.setFillColor(SUBTITLE_COLOR)
+            c.setFont(self.sans, 16)
+            c.drawCentredString(cx, y - 52, f"Version {info.version.lstrip('vV')}")
+
+        if info.company:
+            c.setFillColor(HEADER_FOOTER_COLOR)
+            c.setFont(self.sans_bold, 13)
+            company = simpleSplit(info.company, self.sans_bold, 13, max_w)[0]
+            c.drawCentredString(cx, self.margin + 25 * mm, company)
+
+    # ---- document ------------------------------------------------------ #
+
+    def render(self, out_path: Path, info: ProjectInfo, docs: list[FileDoc],
                background: str | None, show_line_numbers: bool) -> int:
-        total = sum(len(d.pages) for d in docs)
+        toc_pages = self._paginate_toc(self._toc_rows(docs))
+        starts, page = [], 2 + len(toc_pages)  # title page + contents come first
+        for doc in docs:
+            starts.append(page)
+            page += len(doc.pages)
+        total = page - 1
+
         c = canvas.Canvas(str(out_path), pagesize=(self.page_w, self.page_h))
-        c.setTitle(project_name)
-        page_no = 0
+        c.setTitle(info.label)
+        c.setSubject("Source code listing")
+        if info.company:
+            c.setAuthor(info.company)
+
+        c.bookmarkPage("title")
+        c.addOutlineEntry(info.label, "title", level=0)
+        self._draw_title_page(c, info)
+        c.showPage()
+        page_no = 1
+
+        for i, rows in enumerate(toc_pages):
+            page_no += 1
+            if i == 0:
+                c.bookmarkPage("contents")
+                c.addOutlineEntry("Contents", "contents", level=0)
+            self._draw_chrome(c, info.label, "Contents", page_no, total)
+            self._draw_toc(c, rows, starts, first=i == 0)
+            c.showPage()
+
         for doc_idx, doc in enumerate(docs):
             gutter = len(str(max((l.number or 0 for p in doc.pages for l in p), default=1))) + 1
             for p_idx, page in enumerate(doc.pages):
@@ -250,25 +405,30 @@ class Renderer:
                     key = f"file{doc_idx}"
                     c.bookmarkPage(key)
                     c.addOutlineEntry(doc.rel_path, key, level=0)
-                self._draw_chrome(c, project_name, doc.rel_path, page_no, total, background)
+                self._fill_background(c, background)
+                self._draw_chrome(c, info.label, doc.rel_path, page_no, total)
                 self._draw_body(c, page, gutter if show_line_numbers else 0)
                 c.showPage()
         c.save()
         return total
 
-    def _draw_chrome(self, c, project_name, rel_path, page_no, total, background):
-        left, right = self.margin, self.page_w - self.margin
+    def _fill_background(self, c, background: str | None):
         if background and background.lower() not in ("#fff", "#ffffff"):
+            left, right = self.margin, self.page_w - self.margin
             c.setFillColor(HexColor(background))
             c.rect(left, self.body_bottom - 3, right - left,
                    self.header_rule_y - self.body_bottom, stroke=0, fill=1)
 
+    def _draw_chrome(self, c, left_text, right_text, page_no, total):
+        left, right = self.margin, self.page_w - self.margin
+        size = self.header_size
         c.setFillColor(HEADER_FOOTER_COLOR)
-        c.setFont("Helvetica-Bold", self.header_size)
-        c.drawString(left, self.header_y, project_name)
-        c.setFont("Helvetica", self.header_size)
-        path_text = self._fit(rel_path, "Helvetica", right - left - c.stringWidth(project_name, "Helvetica-Bold", self.header_size) - 20)
-        c.drawRightString(right, self.header_y, path_text)
+        left_text = self._fit(left_text, self.sans_bold, size, (right - left) / 2, keep="start")
+        c.setFont(self.sans_bold, size)
+        c.drawString(left, self.header_y, left_text)
+        c.setFont(self.sans, size)
+        avail = right - left - c.stringWidth(left_text, self.sans_bold, size) - 20
+        c.drawRightString(right, self.header_y, self._fit(right_text, self.sans, size, avail))
         c.drawCentredString(self.page_w / 2, self.footer_y, f"{page_no}/{total}")
 
         c.setStrokeColor(RULE_COLOR)
@@ -276,13 +436,15 @@ class Renderer:
         c.line(left, self.header_rule_y, right, self.header_rule_y)
         c.line(left, self.footer_rule_y, right, self.footer_rule_y)
 
-    def _fit(self, text, font, max_w):
-        """Truncate from the left so the end of a long path stays visible."""
-        if pdfmetrics.stringWidth(text, font, self.header_size) <= max_w:
+    @staticmethod
+    def _fit(text, font, size, max_w, keep="end"):
+        """Truncate with an ellipsis; by default from the left so a path's file name stays visible."""
+        width = lambda s: pdfmetrics.stringWidth(s, font, size)
+        if width(text) <= max_w:
             return text
-        while text and pdfmetrics.stringWidth("…" + text, font, self.header_size) > max_w:
-            text = text[1:]
-        return "…" + text
+        while text and width(text + "…" if keep == "start" else "…" + text) > max_w:
+            text = text[:-1] if keep == "start" else text[1:]
+        return text + "…" if keep == "start" else "…" + text
 
     def _draw_body(self, c, page: list[VisualLine], gutter: int):
         x0 = self.margin
@@ -312,6 +474,10 @@ def parse_args(argv=None):
     p.add_argument("project", type=Path, help="project directory")
     p.add_argument("-o", "--output", type=Path,
                    help="output PDF path (default: <project-name>.pdf in the current directory)")
+    p.add_argument("--company", help="company name for the title page (overrides the detected one)")
+    p.add_argument("--title", help="project name for the title page and headers (overrides the detected one)")
+    p.add_argument("--project-version", metavar="VERSION",
+                   help="project version (overrides the detected one)")
     p.add_argument("--style", default="default",
                    help="Pygments color style, e.g. default, friendly, monokai, github-dark (default: default)")
     p.add_argument("--font-size", type=float, default=8.0, help="code font size in points (default: 8)")
@@ -324,7 +490,7 @@ def parse_args(argv=None):
                    help="exclude files/dirs matching GLOB (name or relative path); repeatable")
     p.add_argument("--no-default-excludes", action="store_true",
                    help="do not skip .git, node_modules, __pycache__, etc.")
-    p.add_argument("--no-gitignore", action="store_true", help="ignore the project's .gitignore")
+    p.add_argument("--no-gitignore", action="store_true", help="ignore the project's .gitignore files")
     p.add_argument("--max-size", type=int, default=1024, metavar="KB",
                    help="skip files larger than this many KB (default: 1024)")
     args = p.parse_args(argv)
@@ -364,8 +530,15 @@ def main(argv=None) -> int:
         print("error: no text files found", file=sys.stderr)
         return 1
 
+    info = detect(root)
+    info.name = args.title or info.name
+    info.version = args.project_version or info.version
+    info.company = args.company or info.company
+    print(f"Project: {info.label}" + (f" — {info.company}" if info.company else "")
+          + (f"  (from {info.source})" if info.source else ""))
+
     out.parent.mkdir(parents=True, exist_ok=True)
-    total = renderer.render(out, root.name, docs, style.background_color, not args.no_line_numbers)
+    total = renderer.render(out, info, docs, style.background_color, not args.no_line_numbers)
     print(f"Wrote {out} — {len(docs)} files, {total} pages")
     if skipped:
         print(f"Skipped {len(skipped)} binary/oversized file(s):")
